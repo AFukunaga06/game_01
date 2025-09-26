@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Dot Avoid Run — Minimal</title>
+  <style>
+    :root { --bg: #0f1220; --ui: #ffffff; --accent: #71e6ff; --danger:#ff5d78; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ui); font-family: system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", sans-serif; }
+    #wrap { position: relative; width: min(420px, 100vw); margin: 0 auto; }
+    canvas { width: 100%; height: auto; display: block; background: linear-gradient(180deg, #0b0f1a 0%, #0f1220 100%); border: 1px solid rgba(255,255,255,.08); border-radius: 16px; }
+    .hud { position:absolute; inset:0; pointer-events:none; }
+    .score { position:absolute; top:8px; left:12px; font-weight:700; letter-spacing:.5px; text-shadow:0 2px 6px rgba(0,0,0,.6); }
+    .best { position:absolute; top:8px; right:12px; opacity:.85; }
+    .btnbar { position:absolute; bottom:10px; left:0; right:0; display:flex; justify-content:center; gap:10px; pointer-events:auto; }
+    .btn { padding:10px 14px; border-radius:12px; border:1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.06); color:#fff; font-weight:700; cursor:pointer; backdrop-filter: blur(4px); }
+    .btn:active { transform: translateY(1px); }
+    #overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background: rgba(0,0,0,.55); pointer-events:auto; }
+    .card { width:min(85%, 360px); background: rgba(17,20,36,.95); border:1px solid rgba(255,255,255,.12); border-radius:16px; padding:18px; text-align:center; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    .title { font-size:22px; font-weight:800; margin:2px 0 8px; }
+    .muted { opacity:.85; font-size:14px; }
+    .actions { display:flex; gap:8px; justify-content:center; margin-top:12px; }
+    .adchip { display:inline-block; padding:6px 10px; border-radius:999px; background:rgba(255,255,255,.08); border:1px dashed rgba(255,255,255,.25); font-size:12px; margin-top:6px; }
+    .hide { display:none !important; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="360" height="640" aria-label="Dot Avoid Run"></canvas>
+    <div class="hud">
+      <div class="score" id="score">0 m</div>
+      <div class="best" id="best">Best: 0 m</div>
+      <div class="btnbar">
+        <button class="btn" id="btnPause">⏸ 一時停止</button>
+        <button class="btn" id="btnRestart">🔁 リスタート</button>
+      </div>
+    </div>
+    <!-- Overlay (menu / gameover / fake ad) -->
+    <div id="overlay" class="hide">
+      <div class="card" id="menuCard">
+        <div class="title">Dot Avoid Run</div>
+        <div class="muted">1本指で左右に動かして、障害物のすき間を抜けよう！</div>
+        <div class="actions">
+          <button class="btn" id="btnStart">▶ はじめる</button>
+        </div>
+        <div style="margin-top:8px; font-size:12px; opacity:.85;">PC: ← → / A D キーでも移動</div>
+      </div>
+      <div class="card hide" id="overCard">
+        <div class="title" id="overTitle">ゲームオーバー</div>
+        <div class="muted">スコア: <b id="finalScore">0</b> m</div>
+        <div class="adchip">広告デモ: 報酬型で復活できます</div>
+        <div class="actions">
+          <button class="btn" id="btnRevive">🎥 広告を見て復活（デモ）</button>
+          <button class="btn" id="btnAgain">🔁 もう一度</button>
+        </div>
+      </div>
+      <div class="card hide" id="adCard">
+        <div class="title">広告視聴中…（デモ）</div>
+        <div class="muted">あと <b id="adCountdown">3</b> 秒</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ================== 基本設定 ==================
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // 端末の解像度に合わせてドットを高精細化
+  const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  function resizeCanvas() {
+    const { width, height } = canvas;
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // 論理サイズ=CSSピクセル
+  }
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+
+  // ================== ゲームステート ==================
+  const STATE = { MENU: 'menu', PLAY: 'play', PAUSE:'pause', OVER:'over', AD:'ad' };
+  let state = STATE.MENU;
+  let revivedOnce = false;
+
+  // スコア
+  let distance = 0; // m 表示
+  let best = Number(localStorage.getItem('dar_best') || 0);
+  const scoreEl = document.getElementById('score');
+  const bestEl = document.getElementById('best');
+  bestEl.textContent = `Best: ${best} m`;
+
+  // プレイヤー
+  const player = {
+    x: canvas.width / dpr / 2 - 12,
+    y: canvas.height / dpr - 120,
+    w: 24,
+    h: 24,
+    speedX: 0,
+    maxSpeed: 260, // px/sec
+    invulTime: 0,
+  };
+
+  // 入力
+  let inputX = null; // 目標座標（タッチ/マウス）
+  let keyL = false, keyR = false;
+
+  // 障害物（上下に帯 + すき間）
+  const obstacles = [];
+  let spawnTimer = 0;
+  let gameTime = 0; // 累計経過
+
+  const params = {
+    baseScroll: 120,    // px/sec（障害物の落下速度）
+    spawnInterval: 0.9, // 秒
+    thickness: 22,      // 帯の厚み
+    gapMin: 90,
+    gapMax: 180,
+  };
+
+  function resetGame(full=true) {
+    distance = 0;
+    gameTime = 0;
+    spawnTimer = 0;
+    obstacles.length = 0;
+    player.x = canvas.width / dpr / 2 - player.w/2;
+    player.speedX = 0;
+    player.invulTime = 0;
+    if (full) revivedOnce = false;
+  }
+
+  // ================== 生成ロジック ==================
+  function rand(min, max){ return Math.random() * (max - min) + min; }
+
+  function difficultyCurve(t){
+    // t(秒)に応じてスクロール速度↑ / すき間↓ / 出現間隔↓
+    const scroll = params.baseScroll + Math.min(260, t*10); // 徐々に早く
+    const gap = Math.max(params.gapMin, params.gapMax - t*1.5); // だんだん狭く
+    const interval = Math.max(0.45, params.spawnInterval - t*0.004); // だんだん頻繁
+    return { scroll, gap, interval };
+  }
+
+  function spawnObstacle() {
+    const { gap } = difficultyCurve(gameTime);
+    const W = canvas.width / dpr;
+    const gapW = gap;
+    const gapX = Math.max(16, Math.min(W - gapW - 16, rand(0, W - gapW))); // 端は少し余白
+    const y = -params.thickness - 4;
+    obstacles.push({ y, gapX, gapW, hit:false });
+  }
+
+  // ================== 衝突判定（帯の左右ブロックとAABB） ==================
+  function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  function checkCollision(o){
+    const W = canvas.width / dpr;
+    const y = o.y;
+    const th = params.thickness;
+
+    // 左ブロック
+    const L = { x: 0, y, w: o.gapX, h: th };
+    // 右ブロック
+    const R = { x: o.gapX + o.gapW, y, w: Math.max(0, W - (o.gapX + o.gapW)), h: th };
+
+    const p = player;
+    return rectsOverlap(p.x, p.y, p.w, p.h, L.x, L.y, L.w, L.h) ||
+           rectsOverlap(p.x, p.y, p.w, p.h, R.x, R.y, R.w, R.h);
+  }
+
+  // ================== ループ ==================
+  let last = performance.now();
+  function loop(now){
+    const dt = Math.min(0.033, (now - last) / 1000); // 安定化（最大33ms）
+    last = now;
+
+    if (state === STATE.PLAY) update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt){
+    gameTime += dt;
+    const { scroll, gap, interval } = difficultyCurve(gameTime);
+
+    // 入力→横移動
+    const W = canvas.width / dpr;
+    if (inputX !== null){
+      const target = Math.max(0, Math.min(W - player.w, inputX - player.w/2));
+      const dir = Math.sign(target - player.x);
+      player.speedX = dir * player.maxSpeed;
+      if (Math.abs(target - player.x) < 4) player.speedX = 0;
+    } else {
+      // キー操作
+      const dir = (keyR?1:0) - (keyL?1:0);
+      player.speedX = dir * player.maxSpeed;
+    }
+    player.x += player.speedX * dt;
+    player.x = Math.max(0, Math.min(W - player.w, player.x));
+
+    // 障害物の移動 & 生成
+    for (const o of obstacles){ o.y += scroll * dt; }
+    spawnTimer += dt;
+    if (spawnTimer >= interval){ spawnTimer = 0; spawnObstacle(); }
+
+    // 画面外の除去
+    for (let i=obstacles.length-1; i>=0; i--){
+      if (obstacles[i].y > canvas.height/dpr + 40) obstacles.splice(i,1);
+    }
+
+    // スコア
+    distance = Math.max(0, Math.floor(gameTime * (scroll/6)));
+    scoreEl.textContent = distance + ' m';
+
+    // 無敵タイム減衰
+    if (player.invulTime > 0) player.invulTime -= dt;
+
+    // 当たり判定
+    if (player.invulTime <= 0){
+      for (const o of obstacles){
+        if (checkCollision(o)) { onGameOver(); break; }
+      }
+    }
+  }
+
+  function render(){
+    const W = canvas.width / dpr; const H = canvas.height / dpr;
+    // 背景（簡易グラデーション + ライン）
+    ctx.clearRect(0,0,W,H);
+    // スクロールライン
+    ctx.globalAlpha = 0.07;
+    ctx.fillStyle = '#ffffff';
+    for (let y= (-(performance.now()/20)%40); y < H; y+=40){
+      ctx.fillRect(0, y, W, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // 障害物
+    for (const o of obstacles){
+      ctx.fillStyle = '#18223e';
+      ctx.fillRect(0, o.y, o.gapX, params.thickness); // 左
+      const rightX = o.gapX + o.gapW;
+      ctx.fillRect(rightX, o.y, Math.max(0, W - rightX), params.thickness); // 右
+      // 輪郭
+      ctx.globalAlpha = .25; ctx.fillStyle = '#71e6ff';
+      ctx.fillRect(0, o.y, o.gapX, 1);
+      ctx.fillRect(rightX, o.y, Math.max(0, W - rightX), 1);
+      ctx.globalAlpha = 1;
+    }
+
+    // プレイヤー
+    const blink = (player.invulTime>0 && Math.floor(player.invulTime*20)%2===0);
+    if (!blink){
+      ctx.fillStyle = '#71e6ff';
+      const r = 6; // 角丸
+      roundRect(ctx, player.x, player.y, player.w, player.h, r);
+      ctx.fill();
+    }
+  }
+
+  function roundRect(ctx, x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+
+  // ================== UI / 進行管理 ==================
+  const overlay = document.getElementById('overlay');
+  const menuCard = document.getElementById('menuCard');
+  const overCard = document.getElementById('overCard');
+  const adCard = document.getElementById('adCard');
+  const btnStart = document.getElementById('btnStart');
+  const btnAgain = document.getElementById('btnAgain');
+  const btnRevive = document.getElementById('btnRevive');
+  const btnPause = document.getElementById('btnPause');
+  const btnRestart = document.getElementById('btnRestart');
+  const finalScore = document.getElementById('finalScore');
+  const overTitle = document.getElementById('overTitle');
+  const adCountdown = document.getElementById('adCountdown');
+
+  function showOverlay(which){
+    overlay.classList.remove('hide');
+    menuCard.classList.add('hide');
+    overCard.classList.add('hide');
+    adCard.classList.add('hide');
+    if (which==='menu') menuCard.classList.remove('hide');
+    if (which==='over') overCard.classList.remove('hide');
+    if (which==='ad') adCard.classList.remove('hide');
+  }
+  function hideOverlay(){ overlay.classList.add('hide'); }
+
+  function startGame(){
+    resetGame(true);
+    state = STATE.PLAY;
+    hideOverlay();
+    logEvent('game_start');
+  }
+
+  function onGameOver(){
+    state = STATE.OVER;
+    finalScore.textContent = distance;
+    if (distance > best){ best = distance; localStorage.setItem('dar_best', best); }
+    bestEl.textContent = `Best: ${best} m`;
+    overTitle.textContent = revivedOnce ? 'ゲームオーバー' : 'ゲームオーバー（復活可）';
+    showOverlay('over');
+    logEvent('game_over', { score: distance });
+  }
+
+  function reviveFlow(){
+    if (revivedOnce) return; // 一度だけ
+    revivedOnce = true;
+    // 広告デモ
+    showOverlay('ad');
+    state = STATE.AD;
+    let t = 3;
+    adCountdown.textContent = t;
+    const timer = setInterval(()=>{
+      t--; adCountdown.textContent = t;
+      if (t<=0){
+        clearInterval(timer);
+        // 復活
+        player.invulTime = 2.5; // 無敵
+        // 直近の障害物を少し下へ動かし安全に
+        for (const o of obstacles){ o.y += 60; }
+        hideOverlay();
+        state = STATE.PLAY;
+        logEvent('revive');
+      }
+    }, 1000);
+  }
+
+  btnStart.addEventListener('click', startGame);
+  btnAgain.addEventListener('click', () => { startGame(); });
+  btnRevive.addEventListener('click', () => { if (!revivedOnce) reviveFlow(); });
+  btnPause.addEventListener('click', () => {
+    if (state === STATE.PLAY){ state = STATE.PAUSE; btnPause.textContent = '▶ 再開'; }
+    else if (state === STATE.PAUSE){ state = STATE.PLAY; btnPause.textContent = '⏸ 一時停止'; }
+  });
+  btnRestart.addEventListener('click', () => { startGame(); });
+
+  // 初期はメニュー表示
+  showOverlay('menu');
+
+  // 入力（タッチ/マウス）
+  const wrap = document.getElementById('wrap');
+  function clientX(e){ return (e.touches? e.touches[0].clientX : e.clientX); }
+  function onPointerDown(e){ if (state===STATE.MENU) return; inputX = getLocalX(clientX(e)); }
+  function onPointerMove(e){ if (inputX!==null) inputX = getLocalX(clientX(e)); }
+  function onPointerUp(){ inputX = null; }
+  function getLocalX(client){
+    const rect = canvas.getBoundingClientRect();
+    const x = (client - rect.left) * (canvas.width/dpr) / rect.width; // CSS→論理座標
+    return x;
+  }
+
+  wrap.addEventListener('mousedown', onPointerDown);
+  wrap.addEventListener('mousemove', onPointerMove);
+  window.addEventListener('mouseup', onPointerUp);
+  wrap.addEventListener('touchstart', (e)=>{ e.preventDefault(); onPointerDown(e); }, {passive:false});
+  wrap.addEventListener('touchmove', (e)=>{ e.preventDefault(); onPointerMove(e); }, {passive:false});
+  wrap.addEventListener('touchend', (e)=>{ e.preventDefault(); onPointerUp(e); }, {passive:false});
+
+  // キー
+  window.addEventListener('keydown', (e)=>{ if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') keyL=true; if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') keyR=true; });
+  window.addEventListener('keyup',   (e)=>{ if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') keyL=false; if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') keyR=false; });
+
+  // 簡易アナリティクス（あとでSDKに差し替え可能）
+  function logEvent(name, payload={}){ try{ console.log('[analytics]', name, payload); }catch(_){} }
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
